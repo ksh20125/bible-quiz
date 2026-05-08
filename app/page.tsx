@@ -2,7 +2,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
-import { doc, setDoc, getDoc, updateDoc, increment, serverTimestamp, onSnapshot, collection, query, orderBy, getDocs, where, writeBatch, addDoc } from "firebase/firestore";
+import { doc, setDoc, getDoc, updateDoc, increment, serverTimestamp, onSnapshot, collection, query, orderBy, getDocs, where, writeBatch, addDoc, limit } from "firebase/firestore";
 import { auth, db } from "../firebase";
 
 type ViewState = "SPLASH" | "REGISTER" | "HOME" | "QUIZ_SETUP" | "QUIZ_PLAY" | "QUIZ_RESULT" | "LEADERBOARD" | "MY_RECORDS" | "DAILY_QUIZ" | "ADMIN";
@@ -10,7 +10,7 @@ type Category = "구약" | "신약" | "전체";
 type Difficulty = "쉬움" | "보통" | "어려움";
 
 type Question = {
-  id: number;
+  id: string;
   category: "구약" | "신약";
   difficulty: Difficulty;
   text: string;
@@ -41,26 +41,15 @@ type QuestionDoc = Omit<Question, "id"> & {
 type QuizHistoryItem = { date: string; score: number; accuracy: number; };
 type DailyQuestion = { id: string; text: string; options: string[]; correctAnswerIndex: number; explanation: string; };
 
-// 1. Mock Data Generator
-const generateMockQuestions = (selectedCategory: Category, selectedDifficulty: Difficulty): Question[] => {
-  const points = selectedDifficulty === "쉬움" ? 10 : selectedDifficulty === "보통" ? 20 : 30;
-  
-  return Array(10).fill(0).map((_, i) => {
-    const actualCategory = selectedCategory === "전체" 
-      ? (i % 2 === 0 ? "구약" : "신약") 
-      : selectedCategory;
-      
-    return {
-      id: i,
-      category: actualCategory,
-      difficulty: selectedDifficulty,
-      text: `[${selectedDifficulty}] ${actualCategory} 관련 모의 퀴즈 문제 ${i + 1}번입니다. 정답은 항상 첫 번째 항목입니다.`,
-      options: ["정답 항목", "오답 항목 A", "오답 항목 B", "오답 항목 C"],
-      correctAnswerIndex: 0,
-      explanation: `이것은 ${selectedDifficulty} 난이도의 ${actualCategory} 문제에 대한 해설입니다. 정답을 맞추어 ${points}점을 획득했습니다.`,
-      points: points,
-    };
-  });
+const getUtcDateKey = (date = new Date()): string => date.toISOString().slice(0, 10);
+
+const shuffle = <T,>(arr: T[]): T[] => {
+  const copied = [...arr];
+  for (let i = copied.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [copied[i], copied[j]] = [copied[j], copied[i]];
+  }
+  return copied;
 };
 
 export default function App() {
@@ -148,7 +137,7 @@ export default function App() {
 
   // Leaderboard real-time subscription
   useEffect(() => {
-    const q = query(collection(db, "users"), orderBy("score", "desc"));
+    const q = query(collection(db, "users"), orderBy("score", "desc"), limit(20));
     const unsub = onSnapshot(q, (snap) => {
       setLeaderboard(snap.docs.map(d => ({ uid: d.id, ...d.data() } as LeaderboardEntry)));
     });
@@ -158,18 +147,17 @@ export default function App() {
   // Load daily question
   const loadDailyQuestion = async () => {
     try {
-      const snap = await getDocs(query(collection(db, "questions"), where("is_daily", "==", true)));
+      const snap = await getDocs(query(collection(db, "questions"), where("is_daily", "==", true), where("active", "==", true)));
       if (!snap.empty) {
         const docs = snap.docs;
         const rand = docs[Math.floor(Math.random() * docs.length)];
         const d = rand.data();
         setDailyQuestion({ id: rand.id, text: d.text, options: d.options, correctAnswerIndex: d.correctAnswerIndex, explanation: d.explanation });
       } else {
-        // Fallback mock daily question
-        setDailyQuestion({ id: "mock", text: "태초에 하나님이 무엇을 창조하셨습니까? (창세기 1:1)", options: ["천지", "빛", "물", "바람"], correctAnswerIndex: 0, explanation: "\"태초에 하나님이 천지를 창조하시니라\" (창세기 1:1) - 하나님께서 처음으로 천지, 즉 하늘과 땅을 창조하셨습니다." });
+        setDailyQuestion(null);
       }
     } catch {
-      setDailyQuestion({ id: "mock", text: "태초에 하나님이 무엇을 창조하셨습니까? (창세기 1:1)", options: ["천지", "빛", "물", "바람"], correctAnswerIndex: 0, explanation: "\"태초에 하나님이 천지를 창조하시니라\" (창세기 1:1) - 하나님께서 처음으로 천지, 즉 하늘과 땅을 창조하셨습니다." });
+      setDailyQuestion(null);
     }
   };
 
@@ -210,15 +198,31 @@ export default function App() {
     setView("QUIZ_SETUP");
   };
 
-  const startQuizPlay = () => {
-    const questions = generateMockQuestions(setupCategory, setupDifficulty);
-    setQuizQuestions(questions);
-    setCurrentQIndex(0);
-    setSelectedOption(null);
-    setIsAnswerChecked(false);
-    setSessionScore(0);
-    setSessionCorrectCount(0);
-    setView("QUIZ_PLAY");
+  const startQuizPlay = async () => {
+    try {
+      const constraints = [where("active", "==", true), where("difficulty", "==", setupDifficulty)];
+      if (setupCategory !== "전체") constraints.push(where("category", "==", setupCategory));
+      const snap = await getDocs(query(collection(db, "questions"), ...constraints));
+      const sampled = shuffle(
+        snap.docs.map((d) => ({ id: d.id, ...(d.data() as Omit<Question, "id">) }))
+      ).slice(0, 10);
+
+      if (sampled.length === 0) {
+        alert("조건에 맞는 활성 문제를 찾지 못했습니다.");
+        return;
+      }
+
+      setQuizQuestions(sampled);
+      setCurrentQIndex(0);
+      setSelectedOption(null);
+      setIsAnswerChecked(false);
+      setSessionScore(0);
+      setSessionCorrectCount(0);
+      setView("QUIZ_PLAY");
+    } catch (error) {
+      console.error("Error loading questions:", error);
+      alert("문제를 불러오는 중 오류가 발생했습니다.");
+    }
   };
 
   const abortQuiz = () => {
@@ -254,13 +258,14 @@ export default function App() {
       const user = auth.currentUser;
       if (user) {
         const userDocRef = doc(db, "users", user.uid);
-        const accuracy = Math.round((sessionCorrectCount / 10) * 100);
-        const today = new Date().toLocaleDateString("ko-KR");
+        const questionCount = quizQuestions.length || 10;
+        const accuracy = Math.round((sessionCorrectCount / questionCount) * 100);
+        const today = getUtcDateKey();
         const newHistory: QuizHistoryItem = { date: today, score: sessionScore, accuracy };
         const updatedHistory = [newHistory, ...quizHistory].slice(0, 5);
         await updateDoc(userDocRef, {
           score: increment(sessionScore),
-          totalAttempts: increment(10),
+          totalAttempts: increment(questionCount),
           correctCount: increment(sessionCorrectCount),
           quizHistory: updatedHistory
         });
@@ -268,7 +273,7 @@ export default function App() {
         setUserData((prev) => prev ? ({
           ...prev,
           score: (prev.score || 0) + sessionScore,
-          totalAttempts: (prev.totalAttempts || 0) + 10,
+          totalAttempts: (prev.totalAttempts || 0) + questionCount,
           correctCount: (prev.correctCount || 0) + sessionCorrectCount,
           quizHistory: updatedHistory
         }) : prev);
@@ -355,7 +360,7 @@ export default function App() {
         </div>
         <div className="action-buttons">
           <button className="btn-primary large" onClick={startQuizSetup}>퀴즈 시작</button>
-          <button className="btn-secondary" onClick={() => { loadDailyQuestion(); const today = new Date().toLocaleDateString("ko-KR"); setDailyCompleted(userData?.dailyCompletedDate === today); setDailyAnswerChecked(false); setDailySelectedOption(null); setDailyCorrect(false); setView("DAILY_QUIZ"); }}>✨ 일일 말씀 퀴즈 (+15점)</button>
+          <button className="btn-secondary" onClick={() => { loadDailyQuestion(); const today = getUtcDateKey(); setDailyCompleted(userData?.dailyCompletedDate === today); setDailyAnswerChecked(false); setDailySelectedOption(null); setDailyCorrect(false); setView("DAILY_QUIZ"); }}>✨ 일일 말씀 퀴즈 (+15점)</button>
         </div>
         <div className="ranking-preview">
           <h3 className="ranking-title">🏆 TOP 3 명예의 전당</h3>
@@ -427,7 +432,7 @@ export default function App() {
     const question = quizQuestions[currentQIndex];
     if (!question) return null;
 
-    const progressPercent = ((currentQIndex) / 10) * 100;
+    const progressPercent = ((currentQIndex) / quizQuestions.length) * 100;
 
     return (
       <div className="container animation-fade-in" style={{ backgroundColor: "white" }}>
@@ -443,7 +448,7 @@ export default function App() {
 
         <div className="quiz-meta">
           <span>{question.category} • {question.difficulty}</span>
-          <span style={{fontWeight: "bold", color: "var(--color-accent)"}}>{currentQIndex + 1} / 10</span>
+          <span style={{fontWeight: "bold", color: "var(--color-accent)"}}>{currentQIndex + 1} / {quizQuestions.length}</span>
         </div>
 
         <div className="quiz-question">{question.text}</div>
@@ -484,7 +489,7 @@ export default function App() {
         {isAnswerChecked && (
           <div style={{marginTop: "20px"}}>
             <button className="btn-primary" onClick={handleNextQuestion}>
-              {currentQIndex < 9 ? "다음 문제" : "결과 확인"}
+              {currentQIndex < quizQuestions.length - 1 ? "다음 문제" : "결과 확인"}
             </button>
           </div>
         )}
@@ -493,7 +498,7 @@ export default function App() {
   }
 
   if (view === "QUIZ_RESULT") {
-    const accuracy = Math.round((sessionCorrectCount / 10) * 100);
+    const accuracy = quizQuestions.length > 0 ? Math.round((sessionCorrectCount / quizQuestions.length) * 100) : 0;
 
     return (
       <div className="container center animation-fade-in">
@@ -505,7 +510,7 @@ export default function App() {
           <div className="score-board">
             <div className="score-row">
               <span>정답 수</span>
-              <span style={{fontWeight: "bold"}}>{sessionCorrectCount} / 10 개</span>
+          <span style={{fontWeight: "bold"}}>{sessionCorrectCount} / {quizQuestions.length} 개</span>
             </div>
             <div className="score-row">
               <span>정답률</span>
@@ -631,7 +636,7 @@ export default function App() {
   }
 
   if (view === "DAILY_QUIZ") {
-    const today = new Date().toLocaleDateString("ko-KR");
+    const today = getUtcDateKey();
     const handleDailyOption = async (idx: number) => {
       if (dailyAnswerChecked) return;
       setDailySelectedOption(idx);
