@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { signInAnonymously, onAuthStateChanged } from "firebase/auth";
 import { doc, setDoc, getDoc, updateDoc, increment, serverTimestamp, onSnapshot, collection, query, orderBy, getDocs, where, writeBatch, addDoc } from "firebase/firestore";
 import { auth, db } from "../firebase";
@@ -21,6 +21,23 @@ type Question = {
 };
 
 type LeaderboardEntry = { uid: string; name: string; department: string; score: number; };
+type UserDoc = {
+  uid: string;
+  name: string;
+  department: string;
+  score: number;
+  totalAttempts: number;
+  correctCount: number;
+  wrongQuestions: number[];
+  dailyCompletedDate: string;
+  quizHistory?: QuizHistoryItem[];
+};
+type QuestionDoc = Omit<Question, "id"> & {
+  id: string;
+  is_daily?: boolean;
+  active?: boolean;
+  createdAt?: unknown;
+};
 type QuizHistoryItem = { date: string; score: number; accuracy: number; };
 type DailyQuestion = { id: string; text: string; options: string[]; correctAnswerIndex: number; explanation: string; };
 
@@ -48,7 +65,7 @@ const generateMockQuestions = (selectedCategory: Category, selectedDifficulty: D
 
 export default function App() {
   const [view, setView] = useState<ViewState>("SPLASH");
-  const [userData, setUserData] = useState<any>(null);
+  const [userData, setUserData] = useState<UserDoc | null>(null);
 
   // Auth/Register State
   const [name, setName] = useState("");
@@ -89,23 +106,28 @@ export default function App() {
   const [adminPwInput, setAdminPwInput] = useState("");
   const [adminPwError, setAdminPwError] = useState(false);
   const [adminTab, setAdminTab] = useState<"questions" | "contest" | "participants" | "reset">("questions");
-  const [adminQuestions, setAdminQuestions] = useState<any[]>([]);
+  const [adminQuestions, setAdminQuestions] = useState<QuestionDoc[]>([]);
   const [newQJson, setNewQJson] = useState("");
   const [jsonError, setJsonError] = useState("");
   const [contestStart, setContestStart] = useState("");
   const [contestEnd, setContestEnd] = useState("");
   const [contestSaved, setContestSaved] = useState(false);
-  const [participants, setParticipants] = useState<any[]>([]);
+  const [participants, setParticipants] = useState<UserDoc[]>([]);
+  const sortedParticipants = useMemo(
+    () => [...participants].sort((a, b) => (b.score || 0) - (a.score || 0)),
+    [participants]
+  );
 
   useEffect(() => {
+    let unsubscribeAuth: (() => void) | null = null;
     const splashTimer = setTimeout(() => {
-      const unsubscribe = onAuthStateChanged(auth, async (user) => {
+      unsubscribeAuth = onAuthStateChanged(auth, async (user) => {
         if (user) {
           try {
             const userDocRef = doc(db, "users", user.uid);
             const userDoc = await getDoc(userDocRef);
             if (userDoc.exists()) {
-              setUserData(userDoc.data());
+              setUserData(userDoc.data() as UserDoc);
               setView("HOME");
             } else {
               setView("REGISTER");
@@ -117,9 +139,11 @@ export default function App() {
           setView("REGISTER");
         }
       });
-      return () => unsubscribe();
     }, 2000);
-    return () => clearTimeout(splashTimer);
+    return () => {
+      clearTimeout(splashTimer);
+      if (unsubscribeAuth) unsubscribeAuth();
+    };
   }, []);
 
   // Leaderboard real-time subscription
@@ -241,13 +265,13 @@ export default function App() {
           quizHistory: updatedHistory
         });
         setQuizHistory(updatedHistory);
-        setUserData((prev: any) => ({
+        setUserData((prev) => prev ? ({
           ...prev,
-          score: (prev?.score || 0) + sessionScore,
-          totalAttempts: (prev?.totalAttempts || 0) + 10,
-          correctCount: (prev?.correctCount || 0) + sessionCorrectCount,
+          score: (prev.score || 0) + sessionScore,
+          totalAttempts: (prev.totalAttempts || 0) + 10,
+          correctCount: (prev.correctCount || 0) + sessionCorrectCount,
           quizHistory: updatedHistory
-        }));
+        }) : prev);
       }
     } catch (error) {
       console.error("Error updating score:", error);
@@ -310,10 +334,10 @@ export default function App() {
             <div style={{background:"white",borderRadius:"16px",padding:"28px 24px",width:"300px",boxShadow:"0 20px 60px rgba(0,0,0,0.3)"}}>
               <h3 style={{margin:"0 0 8px",color:"var(--color-primary)",fontSize:"18px"}}>🔐 관리자 접근</h3>
               <p style={{margin:"0 0 16px",fontSize:"13px",color:"#888"}}>비밀번호를 입력하세요</p>
-              <input id="admin-pw-input" type="password" value={adminPwInput} onChange={e => setAdminPwInput(e.target.value)} onKeyDown={async e => { if (e.key !== "Enter") return; const cfgDoc = await getDoc(doc(db, "admin_config", "settings")); const pw = cfgDoc.exists() ? cfgDoc.data().adminPassword : "1234"; if (adminPwInput === pw) { setShowAdminPopup(false); setAdminTab("questions"); const qSnap = await getDocs(collection(db, "questions")); setAdminQuestions(qSnap.docs.map(d=>({id:d.id,...d.data()}))); const ps = await getDocs(collection(db, "users")); setParticipants(ps.docs.map(d=>d.data())); const cfg = cfgDoc.exists() ? cfgDoc.data() : {}; setContestStart(cfg.contestStart||""); setContestEnd(cfg.contestEnd||""); setView("ADMIN"); } else { setAdminPwError(true); } }} placeholder="비밀번호 입력 후 Enter" className="input" style={{marginBottom:"8px"}} />
+              <input id="admin-pw-input" type="password" value={adminPwInput} onChange={e => setAdminPwInput(e.target.value)} onKeyDown={async e => { if (e.key !== "Enter") return; const cfgDoc = await getDoc(doc(db, "admin_config", "settings")); const cfg = cfgDoc.exists() ? cfgDoc.data() : null; const pw = typeof cfg?.adminPassword === "string" ? cfg.adminPassword : null; if (pw && adminPwInput === pw) { setShowAdminPopup(false); setAdminTab("questions"); const qSnap = await getDocs(collection(db, "questions")); setAdminQuestions(qSnap.docs.map(d=>({id: d.id, ...(d.data() as Omit<QuestionDoc, "id">)}))); const ps = await getDocs(collection(db, "users")); setParticipants(ps.docs.map(d=>d.data() as UserDoc)); setContestStart(cfg?.contestStart||""); setContestEnd(cfg?.contestEnd||""); setView("ADMIN"); } else { setAdminPwError(true); } }} placeholder="비밀번호 입력 후 Enter" className="input" style={{marginBottom:"8px"}} />
               {adminPwError && <p style={{color:"red",fontSize:"13px",margin:"0 0 8px"}}>틀린 비밀번호입니다</p>}
               <div style={{display:"flex",gap:"8px",marginTop:"8px"}}>
-                <button className="btn-primary" style={{margin:0,flex:1}} onClick={async () => { const cfgDoc = await getDoc(doc(db, "admin_config", "settings")); const pw = cfgDoc.exists() ? cfgDoc.data().adminPassword : "1234"; if (adminPwInput === pw) { setShowAdminPopup(false); setAdminTab("questions"); const qSnap = await getDocs(collection(db, "questions")); setAdminQuestions(qSnap.docs.map(d=>({id:d.id,...d.data()}))); const ps = await getDocs(collection(db, "users")); setParticipants(ps.docs.map(d=>d.data())); const cfg = cfgDoc.exists() ? cfgDoc.data() : {}; setContestStart(cfg.contestStart||""); setContestEnd(cfg.contestEnd||""); setView("ADMIN"); } else { setAdminPwError(true); } }}>접근</button>
+                <button className="btn-primary" style={{margin:0,flex:1}} onClick={async () => { const cfgDoc = await getDoc(doc(db, "admin_config", "settings")); const cfg = cfgDoc.exists() ? cfgDoc.data() : null; const pw = typeof cfg?.adminPassword === "string" ? cfg.adminPassword : null; if (pw && adminPwInput === pw) { setShowAdminPopup(false); setAdminTab("questions"); const qSnap = await getDocs(collection(db, "questions")); setAdminQuestions(qSnap.docs.map(d=>({id: d.id, ...(d.data() as Omit<QuestionDoc, "id">)}))); const ps = await getDocs(collection(db, "users")); setParticipants(ps.docs.map(d=>d.data() as UserDoc)); setContestStart(cfg?.contestStart||""); setContestEnd(cfg?.contestEnd||""); setView("ADMIN"); } else { setAdminPwError(true); } }}>접근</button>
                 <button className="btn-secondary" style={{flex:1}} onClick={() => setShowAdminPopup(false)}>취소</button>
               </div>
             </div>
@@ -565,7 +589,7 @@ export default function App() {
     const accuracy = totalAttempts > 0 ? Math.round((correctCount / totalAttempts) * 100) : 0;
     const myUid = userData?.uid || auth.currentUser?.uid;
     const globalRank = leaderboard.findIndex(e => e.uid === myUid) + 1;
-    const wrongQuestions: any[] = userData?.wrongQuestions || [];
+    const wrongQuestions = userData?.wrongQuestions || [];
     const history: QuizHistoryItem[] = quizHistory.length > 0 ? quizHistory : (userData?.quizHistory || []);
     return (
       <div className="container animation-fade-in page-with-nav">
@@ -619,7 +643,9 @@ export default function App() {
           const user = auth.currentUser;
           if (user) {
             await updateDoc(doc(db, "users", user.uid), { score: increment(15), dailyCompletedDate: today });
-            setUserData((prev: any) => ({ ...prev, score: (prev?.score || 0) + 15, dailyCompletedDate: today }));
+            setUserData((prev) =>
+              prev ? { ...prev, score: (prev.score || 0) + 15, dailyCompletedDate: today } : prev
+            );
           }
         } catch (e) { console.error(e); }
       }
@@ -673,7 +699,7 @@ export default function App() {
   }
 
   if (view === "ADMIN") {
-    const deptStats = participants.reduce((acc: any, p: any) => {
+    const deptStats = participants.reduce((acc: Record<string, { count: number; totalScore: number }>, p) => {
       const d = p.department || "미분류";
       if (!acc[d]) acc[d] = { count: 0, totalScore: 0 };
       acc[d].count++;
@@ -690,7 +716,7 @@ export default function App() {
         <div className="tab-bar" style={{marginTop:"8px"}}>
           <button id="admin-tab-q" className={`tab-btn ${adminTab==="questions"?"active":""}`} onClick={()=>setAdminTab("questions")} style={{fontSize:"12px"}}>📝문제</button>
           <button id="admin-tab-c" className={`tab-btn ${adminTab==="contest"?"active":""}`} onClick={()=>setAdminTab("contest")} style={{fontSize:"12px"}}>📅대회</button>
-          <button id="admin-tab-p" className={`tab-btn ${adminTab==="participants"?"active":""}`} onClick={async()=>{const ps=await getDocs(collection(db,"users"));setParticipants(ps.docs.map(d=>d.data()));setAdminTab("participants");}} style={{fontSize:"12px"}}>👥현황</button>
+          <button id="admin-tab-p" className={`tab-btn ${adminTab==="participants"?"active":""}`} onClick={async()=>{const ps=await getDocs(collection(db,"users"));setParticipants(ps.docs.map(d=>d.data() as UserDoc));setAdminTab("participants");}} style={{fontSize:"12px"}}>👥현황</button>
           <button id="admin-tab-r" className={`tab-btn ${adminTab==="reset"?"active":""}`} onClick={()=>setAdminTab("reset")} style={{fontSize:"12px",color:adminTab==="reset"?undefined:"#e44"}}>⚠️초기화</button>
         </div>
 
@@ -706,7 +732,7 @@ export default function App() {
                       <div style={{fontSize:"11px",color:"#888"}}>{q.category} · {q.difficulty} · {q.is_daily?"일일":"일반"}</div>
                     </div>
                     <div style={{display:"flex",gap:"4px",flexShrink:0}}>
-                      <button style={{fontSize:"11px",padding:"4px 8px",border:"1px solid #ddd",borderRadius:"6px",background:q.active===false?"#fee":"#e8f5e9",cursor:"pointer"}} onClick={async()=>{await updateDoc(doc(db,"questions",q.id),{active:q.active===false?true:false});const s=await getDocs(collection(db,"questions"));setAdminQuestions(s.docs.map(d=>({id:d.id,...d.data()})));}}>{q.active===false?"🚫비활성":"✅활성"}</button>
+                      <button style={{fontSize:"11px",padding:"4px 8px",border:"1px solid #ddd",borderRadius:"6px",background:q.active===false?"#fee":"#e8f5e9",cursor:"pointer"}} onClick={async()=>{await updateDoc(doc(db,"questions",q.id),{active:q.active===false?true:false});const s=await getDocs(collection(db,"questions"));setAdminQuestions(s.docs.map(d=>({id: d.id, ...(d.data() as Omit<QuestionDoc, "id">)})));}}>{q.active===false?"🚫비활성":"✅활성"}</button>
                     </div>
                   </div>
                 ))
@@ -726,7 +752,7 @@ export default function App() {
   "active": true
 }`} style={{width:"100%",minHeight:"160px",fontFamily:"monospace",fontSize:"12px",border:"1px solid #ddd",borderRadius:"8px",padding:"10px",resize:"vertical",outline:"none"}} />
               {jsonError && <p style={{color:"red",fontSize:"12px",margin:"4px 0"}}>{jsonError}</p>}
-              <button className="btn-primary" style={{marginTop:"8px"}} onClick={async()=>{ try { const q=JSON.parse(newQJson); if(!q.text||!q.options||q.correctAnswerIndex===undefined) throw new Error("필수 필드 누락"); await addDoc(collection(db,"questions"),{...q,createdAt:serverTimestamp()}); setNewQJson(""); setJsonError(""); const s=await getDocs(collection(db,"questions")); setAdminQuestions(s.docs.map(d=>({id:d.id,...d.data()}))); } catch(e:any){setJsonError(e.message);} }}>하트에 등록</button>
+              <button className="btn-primary" style={{marginTop:"8px"}} onClick={async()=>{ try { const q=JSON.parse(newQJson); if(!q.text||!q.options||q.correctAnswerIndex===undefined) throw new Error("필수 필드 누락"); await addDoc(collection(db,"questions"),{...q,createdAt:serverTimestamp()}); setNewQJson(""); setJsonError(""); const s=await getDocs(collection(db,"questions")); setAdminQuestions(s.docs.map(d=>({id: d.id, ...(d.data() as Omit<QuestionDoc, "id">)}))); } catch(e){setJsonError(e instanceof Error ? e.message : "알 수 없는 오류");} }}>하트에 등록</button>
             </div>
           </div>
         )}
@@ -756,7 +782,7 @@ export default function App() {
         {adminTab === "participants" && (
           <div>
             <div className="stats-grid" style={{marginBottom:"16px"}}>
-              {Object.entries(deptStats).map(([dept,stat]:any)=>(
+              {Object.entries(deptStats).map(([dept,stat])=>(
                 <div key={dept} className="stat-card">
                   <div className="stat-icon">👥</div>
                   <div className="stat-label">{dept}</div>
@@ -767,7 +793,7 @@ export default function App() {
             </div>
             <div className="history-section">
               <div className="section-title">👤 전체 참여자 ({participants.length}명)</div>
-              {participants.sort((a,b)=>(b.score||0)-(a.score||0)).map((p,i)=>(
+              {sortedParticipants.map((p,i)=>(
                 <div key={p.uid||i} className="history-item">
                   <span style={{fontSize:"13px"}}><strong>{p.name}</strong> <span style={{color:"#aaa",fontSize:"11px"}}>({p.department})</span></span>
                   <span className="history-score">{p.score||0}점</span>
@@ -792,7 +818,7 @@ export default function App() {
                 await batch.commit();
                 setParticipants(prev=>prev.map(p=>({...p,score:0,totalAttempts:0,correctCount:0})));
                 alert("✅ 초기화 완료!");
-              } catch(e:any){alert("오류: "+e.message);}
+              } catch(e){alert("오류: "+(e instanceof Error ? e.message : "알 수 없는 오류"));}
             }}>🗑️ 전체 점수 초기화</button>
           </div>
         )}
